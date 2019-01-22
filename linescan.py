@@ -15,6 +15,7 @@ import cv2
 import numpy as np
 from scipy.interpolate import interp1d
 from scipy.integrate import cumtrapz
+import time
 
 # Matplotlib canvas widget (from matplotlib website example)
 class MplCanvas(FigureCanvas):
@@ -57,7 +58,7 @@ class InterfaceWindow(QtGui.QMainWindow):
         self.action_save.triggered.connect(self.save_image)
 
         self.speed_detect_shift = 5
-        self.speed_detect_window = 20
+        self.speed_detect_window = 10
         self.auto_xmap = None
 
         # Start the GUI!
@@ -69,9 +70,10 @@ class InterfaceWindow(QtGui.QMainWindow):
         filedialog = QtGui.QFileDialog(self)
         filedialog.setAcceptMode(0)
         filedialog.setFileMode(1)
+        self.auto_xmap = None
 
         filedialog.setWindowTitle('Load Video...')
-        filedialog.setNameFilter('Video Files (*.mp4 *.avi)')
+        filedialog.setNameFilter('Video Files (*.mp4 *.avi *.mkv)')
         filedialog.exec_()
         if filedialog.result() == 1:
             vid_path = filedialog.selectedFiles()[0]
@@ -103,6 +105,12 @@ class InterfaceWindow(QtGui.QMainWindow):
                 self.display_im = self.imax.imshow(self.image)
                 self.imax.set_axis_off()
 
+                self.aspect_slider.blockSignals(True)
+                self.aspect_slider.setMinimum(int(self.image.shape[1]/4))
+                self.aspect_slider.setMaximum(int(self.image.shape[1]*4))
+                self.aspect_slider.setValue(int(self.image.shape[1]))
+                self.aspect_slider.blockSignals(False)
+
                 self.output_dims.setText('{:d} x {:d} ({:.1f} Mpx)'.format(self.image.shape[1],self.image.shape[0],np.prod(self.image.shape)/1e6))
 
                 time_ind = -1
@@ -112,13 +120,14 @@ class InterfaceWindow(QtGui.QMainWindow):
                 rtl = vid_dialog.rtl.isChecked()
                 output_width = self.image.shape[1]
                 self.app.setOverrideCursor(QtGui.QCursor(QtCore.Qt.WaitCursor))
+                t_last = time.time() - 2
                 while time_ind < n_frames-1:
                     time_ind = time_ind + 1
                     if rtl:
                         im_col_ind = output_width - time_ind - 1
                     else:
                         im_col_ind = time_ind
-                    self.statusbar.showMessage('Reading video frames: {:.0f}%...'.format(100.*time_ind/n_frames))
+                    
                     ret,frame = vid.read()
                     if frame is None:
                         continue
@@ -134,13 +143,17 @@ class InterfaceWindow(QtGui.QMainWindow):
                             self.im_plus[:,im_col_ind,:] = frame[space_ind+self.speed_detect_shift,:,:]
                             self.im_minus[:,im_col_ind,:] = frame[space_ind-self.speed_detect_shift,:,:]
 
-                    if not time_ind % 10:
+                    if time.time() - t_last > 2:
+                        self.statusbar.showMessage('Reading video frames: {:.0f}%...'.format(100.*time_ind/n_frames))
                         self.display_im.set_data(self.image)
                         self.mpl_canvas.draw()
                         self.app.processEvents()
+                        t_last = time.time()
 
                 vid.release()
                 self.im_out = self.image
+                self.display_im.set_data(self.im_out)
+                self.mpl_canvas.draw()
                 self.app.restoreOverrideCursor()
                 self.statusbar.clearMessage()
 
@@ -149,8 +162,7 @@ class InterfaceWindow(QtGui.QMainWindow):
 
         if self.manual_speed_adjust.isChecked():
             self.aspect_slider.setEnabled(True)
-            aspect = 1 + 0.02*self.aspect_slider.value()
-            xmap = np.linspace(0,self.image.shape[1]-1,int(self.image.shape[1]/aspect))
+            xmap = np.linspace(0,self.image.shape[1]-1,self.aspect_slider.value())
 
         elif self.auto_speed_adjust.isChecked():
             self.aspect_slider.setEnabled(False)
@@ -158,15 +170,18 @@ class InterfaceWindow(QtGui.QMainWindow):
                 self.app.setOverrideCursor(QtGui.QCursor(QtCore.Qt.WaitCursor))
                 speed = []
                 refpos = []
+                t_last = time.time() - 2
                 for i in range(0,self.image.shape[1]-self.speed_detect_window,self.speed_detect_window):
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(cv2.matchTemplate(self.im_minus[:,i:i+self.speed_detect_window],self.im_plus,cv2.TM_CCORR_NORMED))
-                    if abs(max_loc[0] - i) > 0: 
-                        speed.append( abs( 2*self.speed_detect_shift / (max_loc[0] - i) ) )
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(cv2.matchTemplate(self.im_minus[:,i:i+self.speed_detect_window],self.im_plus[:,max(0,i-self.speed_detect_window*10):min(self.im_plus.shape[1],i+self.speed_detect_window*10)],cv2.TM_CCORR_NORMED))
+                    if abs(max_loc[0] - (self.speed_detect_window*10.) ) > 0: 
+                        speed.append( abs( 2*self.speed_detect_shift / (max_loc[0] - (self.speed_detect_window*10.)) ) )
                     else:
                         speed.append(0)
                     refpos.append(i)
-                    self.app.processEvents()
-                    self.statusbar.showMessage('Detecting scan speed: {:.0f}%...'.format(100*i/self.image.shape[1]))
+                    if time.time() - t_last > 2:
+                        self.app.processEvents()
+                        self.statusbar.showMessage('Detecting scan speed: {:.0f}%...'.format(100*i/self.image.shape[1]))
+                        t_last = time.time()
                 self.app.restoreOverrideCursor()
                 refpos = np.array(refpos)
                 speed = np.array(speed)                
@@ -188,7 +203,13 @@ class InterfaceWindow(QtGui.QMainWindow):
         ymap = np.tile( np.linspace(0,self.image.shape[0]-1,int(self.image.shape[0]*factor))[:,np.newaxis],[1,xmap.size] ).astype('float32')
         xmap = np.tile(xmap[np.newaxis,:],[ymap.shape[0],1]).astype('float32')
 
-        self.im_out = cv2.remap(self.image,xmap,ymap,cv2.INTER_CUBIC)
+        self.im_out = np.zeros(xmap.shape + (3,),dtype=np.uint8)
+
+        max_dim = 32000
+
+        for n_tile in range(int(np.ceil(xmap.shape[1]/max_dim))):
+
+            self.im_out[:,n_tile*max_dim:min(xmap.shape[1],(n_tile+1)*max_dim),:] = cv2.remap(self.image,xmap[:,n_tile*max_dim:min(xmap.shape[1],(n_tile+1)*max_dim)],ymap[:,n_tile*max_dim:min(xmap.shape[1],(n_tile+1)*max_dim)],cv2.INTER_LANCZOS4)
 
         self.output_dims.setText('{:d} x {:d} ({:.1f} Mpx)'.format(self.im_out.shape[1],self.im_out.shape[0],np.prod(self.im_out.shape)/1e6))
 
@@ -271,10 +292,14 @@ class LoadVideoDialog(QtGui.QDialog):
 
         vid.release()
 
+        self.time_opened = time.time()
         self.mpl_canvas.mpl_connect('button_release_event',self.move_line)
 
 
     def move_line(self,event):
+        if time.time() - self.time_opened < 0.5:
+            return
+
         if self.select_col.isChecked():
             self.line_index.setValue(event.xdata)
         elif self.select_row.isChecked():
@@ -296,7 +321,7 @@ class LoadVideoDialog(QtGui.QDialog):
 
 if __name__ == '__main__':
 
-	# Create a GUI application
+    # Create a GUI application
     app = QtGui.QApplication([])
     
     # Create an instance of InterfaceWindow
